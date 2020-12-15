@@ -1,6 +1,12 @@
-use std::{iter::FusedIterator, slice, sync::Arc};
+use std::{
+    hash::{Hash, Hasher},
+    iter::FusedIterator,
+    slice,
+    sync::Arc,
+};
 
 use erasable::Thin;
+use rustc_hash::FxHasher;
 use slice_dst::SliceWithHeader;
 
 use crate::{
@@ -13,11 +19,12 @@ use crate::{
 pub(super) struct GreenNodeHead {
     kind: SyntaxKind,
     text_len: TextSize,
+    child_hash: u32,
 }
 
 /// Internal node in the immutable tree.
 /// It has other nodes and tokens as children.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct GreenNode {
     pub(super) data: Thin<Arc<SliceWithHeader<GreenNodeHead, PackedGreenElement>>>,
@@ -31,17 +38,25 @@ impl GreenNode {
         I: IntoIterator<Item = GreenElement>,
         I::IntoIter: ExactSizeIterator,
     {
+        let mut hasher = FxHasher::default();
         let mut text_len: TextSize = 0.into();
         let children = children
             .into_iter()
-            .inspect(|it| text_len += it.text_len())
+            .inspect(|it| {
+                text_len += it.text_len();
+                it.hash(&mut hasher);
+            })
             .map(PackedGreenElement::from);
-        let mut data: Arc<_> =
-            SliceWithHeader::new(GreenNodeHead { kind, text_len: 0.into() }, children);
+        let mut data: Arc<_> = SliceWithHeader::new(
+            GreenNodeHead { kind, text_len: 0.into(), child_hash: 0 },
+            children,
+        );
 
-        // XXX: fixup `text_len` after construction, because we can't iterate
-        // `children` twice.
-        Arc::get_mut(&mut data).unwrap().header.text_len = text_len;
+        // XXX: fixup `text_len` and `child_hash` after construction, because we
+        // can't iterate `children` twice.
+        let header = &mut Arc::get_mut(&mut data).unwrap().header;
+        header.text_len = text_len;
+        header.child_hash = hasher.finish() as u32;
 
         GreenNode { data: data.into() }
     }
@@ -67,6 +82,13 @@ impl GreenNode {
     pub(crate) fn ptr(&self) -> *const u8 {
         let r: &SliceWithHeader<_, _> = &*self.data;
         r as *const _ as _
+    }
+}
+
+impl Hash for GreenNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let data: Arc<_> = self.data.clone().into();
+        data.header.hash(state);
     }
 }
 
